@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install ruff pytest capstone pefile pyelftools
+
+      - name: Lint
+        run: ruff check .
+
+      # GUI без дисплея не поднять, поэтому только компиляция; ядро тестируется по-настоящему
+      - name: Byte-compile GUI
+        run: python -m compileall -q gui.py
+
+      - name: Tests
+        run: python -m pytest -q
