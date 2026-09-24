@@ -39,7 +39,33 @@ jobs:
         run: python tests/smoke_gui.py C:\Windows\System32\notepad.exe
 
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --onefile --windowed --name DisasmGUI --collect-all customtkinter --collect-all capstone gui.py
+        run: |
+          python tools/version_file.py ${{ inputs.version || github.ref_name }} > version.txt
+          python -m PyInstaller --noconfirm --onefile --windowed --name DisasmGUI --version-file version.txt --collect-all customtkinter --collect-all capstone gui.py
+
+      # Подпись через SignPath Foundation. Шаги ниже пропускаются, пока в
+      # Settings -> Secrets and variables -> Actions не заведены переменная
+      # SIGNPATH_ORGANIZATION_ID и секрет SIGNPATH_API_TOKEN (их выдают после
+      # одобрения заявки). Каждую подпись нужно вручную подтвердить в SignPath.
+      - name: Upload unsigned exe
+        id: unsigned
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisasmGUI-unsigned
+          path: dist/DisasmGUI.exe
+
+      - name: Sign with SignPath
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: disasm-gui
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist
 
       - name: Checksum
         shell: pwsh

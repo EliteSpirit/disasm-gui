@@ -9,3 +9,4 @@ dist/
 .vscode/
 .idea/
 Thumbs.db
+version.txt

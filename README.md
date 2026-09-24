@@ -52,6 +52,21 @@ python gui.py              # или сразу: python gui.py путь/к/фай
 - `gui.py` — интерфейс.
 - `tests/` — тесты ядра (`python -m pytest`).
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+Windows releases (`DisasmGUI.exe`) are built from this repository by the [Release workflow](.github/workflows/release.yml) on GitHub Actions and signed only after manual approval.
+
+Team roles:
+
+- Committers and reviewers: [EliteSpirit](https://github.com/EliteSpirit)
+- Approvers: [EliteSpirit](https://github.com/EliteSpirit)
+
+### Privacy policy
+
+This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Disasm GUI has no network code at all: it only reads the files you open.
+
 ## Лицензия
 
 MIT, см. [LICENSE](LICENSE).
