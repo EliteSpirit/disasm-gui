@@ -59,4 +59,6 @@ def main(path: str) -> int:
 
 
 if __name__ == "__main__":
+    # консоль Windows-раннера в cp1252 и падает на кириллице в print
+    sys.stdout.reconfigure(encoding="utf-8")
     sys.exit(main(sys.argv[1]))
