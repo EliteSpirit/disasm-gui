@@ -21,9 +21,29 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      # GUI без дисплея не поднять, поэтому только компиляция; ядро тестируется по-настоящему
+      # на Linux-раннере нет дисплея, поэтому GUI только компилируем; запуск окна — в job windows
       - name: Byte-compile GUI
         run: python -m compileall -q gui.py
 
       - name: Tests
         run: python -m pytest -q
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: GUI smoke test
+        run: python tests/smoke_gui.py C:\Windows\System32\notepad.exe

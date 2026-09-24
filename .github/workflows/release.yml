@@ -1,0 +1,47 @@
+name: Release
+
+# Релиз собирается сам при пуше тега вида v0.1.0:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pyinstaller
+
+      - name: Tests
+        run: python -m pytest -q
+
+      # настоящий запуск окна на Windows: открыть notepad.exe, прокрутить, перейти по call
+      - name: GUI smoke test
+        run: python tests/smoke_gui.py C:\Windows\System32\notepad.exe
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --onefile --windowed --name DisasmGUI --collect-all customtkinter --collect-all capstone gui.py
+
+      - name: Checksum
+        shell: pwsh
+        run: (Get-FileHash dist\DisasmGUI.exe -Algorithm SHA256).Hash.ToLower() + "  DisasmGUI.exe" | Out-File -Encoding ascii dist\DisasmGUI.exe.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Disasm GUI ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/DisasmGUI.exe
+            dist/DisasmGUI.exe.sha256
