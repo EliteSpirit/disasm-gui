@@ -1,10 +1,17 @@
 name: Release
 
-# Релиз собирается сам при пуше тега вида v0.1.0:
-#   git tag v0.1.0 && git push origin v0.1.0
+# Два способа выпустить релиз:
+#   1. Actions -> Release -> Run workflow, вписать версию (например v0.1.0);
+#      тег на текущем main поставится сам.
+#   2. Запушить тег: git tag v0.1.0 && git push origin v0.1.0
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия, например v0.1.0"
+        required: true
 
 permissions:
   contents: write
@@ -40,7 +47,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          name: Disasm GUI ${{ github.ref_name }}
+          tag_name: ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: Disasm GUI ${{ inputs.version || github.ref_name }}
           body_path: RELEASE_NOTES.md
           files: |
             dist/DisasmGUI.exe
