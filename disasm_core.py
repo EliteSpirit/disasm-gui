@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import bisect
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,18 @@ GROUP_RET = "ret"
 GROUP_OTHER = "other"
 
 _HEX_TARGET = re.compile(r"^#?(0x[0-9a-fA-F]+)$")
+
+# сколько нулей всего можно дописать к секциям PE (хвосты .bss и т.п.): VirtualSize в битом
+# или вредоносном файле может быть любым, а выделять под него гигабайты памяти нельзя
+MAX_PE_ZERO_FILL = 64 * 1024 * 1024
+
+# типы символов ELF, которые показываем; STT_LOOS — это STT_GNU_IFUNC (memcpy, strlen в glibc)
+_ELF_SYM_TYPES = ("STT_FUNC", "STT_OBJECT", "STT_LOOS")
+
+# релокации x86-64, связывающие слот GOT с импортом
+_R_X86_64_GLOB_DAT = 6
+_R_X86_64_JUMP_SLOT = 7
+_R_X86_64_IRELATIVE = 37
 
 
 class LoadError(Exception):
@@ -101,6 +114,24 @@ class Binary:
         if sec is None or not sec.contains(addr) or addr - base > 0x10000:
             return None
         return f"{self.symbols[base]}+{addr - base:#x}"
+
+    def resolve(self, text: str) -> int | None:
+        """
+        Адрес по тому, что ввели в «Перейти»: сначала точное имя символа (иначе `f32addf64`
+        из libm прочитался бы как hex), потом адрес, потом первый символ, где есть подстрока.
+        """
+        low = text.strip().lower()
+        if not low:
+            return None
+        names = [(a, self.symbols[a].lower()) for a in self._sym_addrs]
+        exact = next((a for a, n in names if n == low), None)
+        if exact is not None:
+            return exact
+        try:
+            return parse_address(low)
+        except ValueError:
+            pass
+        return next((a for a, n in names if low in n), None)
 
     def default_address(self) -> int:
         if self.entry is not None and self.section_at(self.entry):
@@ -286,12 +317,15 @@ def _load_pe(path: Path, data: bytes) -> Binary:
 
     base = pe.OPTIONAL_HEADER.ImageBase
     sections = []
+    zero_budget = MAX_PE_ZERO_FILL
     for s in pe.sections:
         name = s.Name.rstrip(b"\x00").decode("latin-1") or "?"
-        # в памяти секция может быть больше, чем на диске (.bss) — добиваем нулями
+        # в памяти секция может быть больше, чем на диске (.bss) — добиваем нулями,
+        # но не больше общего лимита: VirtualSize = 0xF0000000 в файле на 90 КБ — не повод для MemoryError
         body = s.get_data()
-        size = max(s.Misc_VirtualSize, len(body)) if s.Misc_VirtualSize else len(body)
-        body = body[:size].ljust(size, b"\x00")
+        pad = min(max(0, s.Misc_VirtualSize - len(body)), zero_budget)
+        zero_budget -= pad
+        body += bytes(pad)
         exe = bool(s.Characteristics & 0x20000000)  # IMAGE_SCN_MEM_EXECUTE
         sections.append(Section(name, base + s.VirtualAddress, s.PointerToRawData, body, exe))
     if not sections:
@@ -303,13 +337,22 @@ def _load_pe(path: Path, data: bytes) -> Binary:
         for f in imp.imports:
             fname = f.name.decode("latin-1", "replace") if f.name else f"#{f.ordinal}"
             symbols[f.address] = f"{dll}!{fname}"
+    # у ARM (Thumb-2) младший бит адреса кода — признак Thumb, а не часть адреса:
+    # точка входа 0x4024cd на самом деле 0x4024cc, иначе листинг начинается с мусора
+    thumb = arch_name == "ARM Thumb"
+
+    def code_addr(addr: int) -> int:
+        if thumb and any(sec.executable and sec.contains(addr) for sec in sections):
+            return addr & ~1
+        return addr
+
     exp = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
     if exp is not None:
         for s in exp.symbols:
             if s.name:
-                symbols[base + s.address] = s.name.decode("latin-1", "replace")
+                symbols[code_addr(base + s.address)] = s.name.decode("latin-1", "replace")
 
-    entry = base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
+    entry = code_addr(base + pe.OPTIONAL_HEADER.AddressOfEntryPoint)
     symbols.setdefault(entry, "entry")
     pe.close()
     return Binary(path, "PE", arch_name, arch, mode, entry, sections, symbols)
@@ -361,16 +404,36 @@ def _load_elf(path: Path) -> Binary:
             raise LoadError("В ELF нет загружаемых секций")
 
         symbols: dict[int, str] = {}
+        thumb_funcs = arm_funcs = 0
         for s in elf.iter_sections():
             if not isinstance(s, SymbolTableSection):
                 continue
             for sym in s.iter_symbols():
-                if sym.name and sym["st_value"] and sym["st_info"]["type"] in ("STT_FUNC", "STT_OBJECT"):
-                    symbols.setdefault(sym["st_value"] & ~1 if arch_name == "ARM" else sym["st_value"],
-                                       sym.name)
-        _add_plt_symbols(elf, sections, symbols)
+                kind = sym["st_info"]["type"]
+                value = sym["st_value"]
+                # SHN_UNDEF — импорт; у не-PIE его «адрес» указывает на заглушку в .plt,
+                # которую ниже подпишем как `name@plt`
+                if not sym.name or not value or sym["st_shndx"] == "SHN_UNDEF" or kind not in _ELF_SYM_TYPES:
+                    continue
+                if arch_name == "ARM" and kind != "STT_OBJECT":
+                    # у функций ARM младший бит адреса = Thumb-код
+                    thumb_funcs += value & 1
+                    arm_funcs += not value & 1
+                    value &= ~1
+                symbols.setdefault(value, sym.name)
+        _add_plt_symbols(elf, symbols)
 
         entry = elf["e_entry"] or None
+        if arch_name == "ARM":
+            # Режим один на весь файл: Thumb, если с него стартует программа (нечётный e_entry),
+            # а у библиотек без точки входа — если Thumb-функций больше. Смешанный ARM/Thumb-код
+            # так не покрыть, но armhf-сборки почти целиком Thumb-2
+            thumb = bool(entry & 1) if entry is not None else thumb_funcs > arm_funcs
+            if thumb:
+                arch_name = "ARM Thumb"
+                arch, mode = RAW_ARCHS[arch_name]
+            if entry is not None:
+                entry &= ~1
         if entry is not None:
             symbols.setdefault(entry, "_start")
         return Binary(path, "ELF", arch_name, arch, mode, entry, sections, symbols)
@@ -380,30 +443,58 @@ def _load_elf(path: Path) -> Binary:
         f.close()
 
 
-def _add_plt_symbols(elf, sections: list[Section], symbols: dict[int, str]) -> None:
-    """Подписываем заглушки .plt / .plt.sec именами импортов (только x86-64, самый частый случай)."""
+def _add_plt_symbols(elf, symbols: dict[int, str]) -> None:
+    """
+    Подписываем слоты GOT (`printf@got`) и заглушки .plt / .plt.sec / .plt.got (`printf@plt`)
+    именами импортов. Только x86-64, самый частый случай.
+    """
+    from elftools.elf.sections import SymbolTableSection
+
     if elf["e_machine"] != "EM_X86_64":
         return
-    rela = elf.get_section_by_name(".rela.plt")
-    if rela is None:
-        return
-    dynsym = elf.get_section(rela["sh_link"])
-    got_to_name = {}
-    for r in rela.iter_relocations():
-        name = dynsym.get_symbol(r["r_info_sym"]).name
-        if name:
-            got_to_name[r["r_offset"]] = name
-    for sec in sections:
-        if sec.name not in (".plt", ".plt.sec", ".plt.got"):
+    got_to_name: dict[int, str] = {}
+    fmt = "<QQq" if elf.little_endian else ">QQq"
+    # .rela.plt — ленивые JUMP_SLOT, .rela.dyn — GLOB_DAT, на которые смотрит .plt.got
+    for rela_name in (".rela.plt", ".rela.dyn"):
+        rela = elf.get_section_by_name(rela_name)
+        if rela is None or rela["sh_type"] != "SHT_RELA" or rela["sh_entsize"] != 24:
+            continue
+        dynsym = elf.get_section(rela["sh_link"])
+        if not isinstance(dynsym, SymbolTableSection):
+            continue
+        data = rela.data()
+        # struct вместо iter_relocations: в .rela.dyn больших бинарников сотни тысяч записей
+        for offset, info, addend in struct.iter_unpack(fmt, data[:len(data) // 24 * 24]):
+            kind, sym_idx = info & 0xFFFFFFFF, info >> 32
+            if kind in (_R_X86_64_JUMP_SLOT, _R_X86_64_GLOB_DAT) and sym_idx:
+                name = dynsym.get_symbol(sym_idx).name
+            elif kind == _R_X86_64_IRELATIVE:
+                # у IRELATIVE нет символа, но addend — адрес IFUNC-резолвера, а он обычно подписан
+                name = symbols.get(addend)
+            else:
+                continue
+            if name:
+                got_to_name[offset] = name
+    for slot, name in got_to_name.items():
+        symbols.setdefault(slot, f"{name}@got")
+
+    for sec_name in (".plt", ".plt.sec", ".plt.got"):
+        sec = elf.get_section_by_name(sec_name)
+        if sec is None or not sec["sh_addr"]:
             continue
         md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
         md.detail = True
-        for ins in md.disasm(sec.data, sec.vaddr):
+        prev = None
+        for ins in md.disasm(sec.data(), sec["sh_addr"]):
+            # с IBT заглушка начинается с endbr64 перед jmp; записи .plt.got без IBT
+            # по 8 байт, так что выравнивать адрес на 16 нельзя
+            stub = prev.address if prev is not None and prev.mnemonic == "endbr64" else ins.address
+            prev = ins
             # jmp qword ptr [rip + X] — считаем, куда ссылается X
-            if ins.mnemonic in ("jmp", "bnd jmp") and "rip" in ins.op_str:
-                for op in ins.operands:
-                    if op.type == cs.x86.X86_OP_MEM and op.mem.base == cs.x86.X86_REG_RIP:
-                        slot = ins.address + ins.size + op.mem.disp
-                        if slot in got_to_name:
-                            stub = ins.address & ~0xF
-                            symbols.setdefault(stub, f"{got_to_name[slot]}@plt")
+            if ins.mnemonic not in ("jmp", "bnd jmp") or "rip" not in ins.op_str:
+                continue
+            for op in ins.operands:
+                if op.type == cs.x86.X86_OP_MEM and op.mem.base == cs.x86.X86_REG_RIP:
+                    name = got_to_name.get(ins.address + ins.size + op.mem.disp)
+                    if name:
+                        symbols.setdefault(stub, f"{name}@plt")
