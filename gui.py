@@ -69,6 +69,16 @@ MAX_BYTES_SHOWN = 8
 MONO_CANDIDATES = ("Cascadia Mono", "Consolas", "JetBrains Mono", "Fira Code", "DejaVu Sans Mono",
                    "Menlo", "Courier New")
 
+# Ctrl+буква в русской раскладке приходит в Tk с кириллическим keysym (Cyrillic_a вместо f),
+# и привязки вида <Control-f> молчат — не работают ни наши хоткеи, ни Ctrl+C/V в полях ввода.
+# Такие нажатия перевыпускаем с латинской буквой: на Windows по коду клавиши (VK_A..VK_Z
+# от раскладки не зависят), в остальных ОС — по положению буквы в ЙЦУКЕН.
+CYRILLIC_TO_LATIN = {
+    "Cyrillic_shcha": "o", "Cyrillic_pe": "g", "Cyrillic_a": "f", "Cyrillic_es": "c",
+    "Cyrillic_em": "v", "Cyrillic_che": "x", "Cyrillic_ef": "a",
+}
+WIN_ALT_MASK = 0x20000  # бит Alt в event.state на Windows
+
 
 def _lerp_color(c1: str, c2: str, t: float) -> str:
     c1, c2 = c1.lstrip("#"), c2.lstrip("#")
@@ -79,6 +89,18 @@ def _lerp_color(c1: str, c2: str, t: float) -> str:
 
 def _ease_out(t: float) -> float:
     return 1 - (1 - t) ** 3
+
+
+def ctrl_letter(keysym: str, keycode: int, state: int, windowing: str) -> str | None:
+    """Латинская буква для Ctrl+клавиши в нелатинской раскладке; None, если нажатие обычное."""
+    if windowing != "win32":
+        return CYRILLIC_TO_LATIN.get(keysym)
+    letter = chr(keycode).lower() if 65 <= keycode <= 90 else None
+    # в латинской раскладке keysym и есть буква клавиши — это обычное нажатие; с Alt — это AltGr
+    # (на Windows он же Ctrl+Alt), которым набирают €, ą и т.п., его тоже не трогаем
+    if letter is None or keysym.lower() == letter or state & WIN_ALT_MASK:
+        return None
+    return letter
 
 
 class Row:
@@ -171,6 +193,7 @@ class App(ctk.CTk):
         self._extending = False
         self._busy = 0
         self._jobs: queue.Queue = queue.Queue()
+        self._load_seq = 0  # номер последней загрузки: результаты более ранних отбрасываем
         self._sym_items: list[tuple[int, str]] = []
         self._sym_shown: list[int] = []
         self._search_hits: list[int] = []
@@ -297,7 +320,8 @@ class App(ctk.CTk):
 
         t.tag_bind("link", "<Enter>", lambda e: t.configure(cursor="hand2"))
         t.tag_bind("link", "<Leave>", lambda e: t.configure(cursor="arrow"))
-        t.tag_bind("link", "<Button-1>", self._on_link_click)
+        # клик по ссылке разбирает _on_text_click: tag_bind на «link» срабатывал раньше
+        # обычного обработчика клика, и тот переставлял текущую строку на ту, что оказалась под мышью
         t.bind("<Button-1>", self._on_text_click, add="+")
         t.bind("<Motion>", self._on_motion)
         t.bind("<Leave>", lambda e: self._set_hover(None))
@@ -354,6 +378,7 @@ class App(ctk.CTk):
         self.bind_all("<Control-equal>", lambda e: self.zoom(+1))
         self.bind_all("<Control-plus>", lambda e: self.zoom(+1))
         self.bind_all("<Control-minus>", lambda e: self.zoom(-1))
+        self.bind_all("<Control-KeyPress>", self._on_ctrl_nonlatin)
         t = self.text
         t.bind("<Escape>", lambda e: self.go_back())
         t.bind("<Return>", lambda e: self.follow_current())
@@ -366,6 +391,14 @@ class App(ctk.CTk):
     def _focus_entry(self, entry):
         entry.focus_set()
         entry.select_range(0, "end")
+        return "break"
+
+    def _on_ctrl_nonlatin(self, event):
+        """Ctrl+буква в нелатинской раскладке: перевыпускаем событие с латинской буквой."""
+        letter = ctrl_letter(event.keysym, event.keycode, event.state, self.tk.call("tk", "windowingsystem"))
+        if letter is None or not hasattr(event.widget, "event_generate"):
+            return None
+        event.widget.event_generate(f"<Control-{letter}>")
         return "break"
 
     # ------------------------------------------------------------ фоновые задачи
@@ -435,9 +468,13 @@ class App(ctk.CTk):
                 return core.load_raw(p, p.read_bytes(), *raw_opts)
             return core.load(p)
 
-        self.run_bg(work, self._on_loaded, f"Загружаю {p.name}…")
+        self._load_seq += 1
+        seq = self._load_seq
+        self.run_bg(work, lambda binary, err: self._on_loaded(binary, err, seq), f"Загружаю {p.name}…")
 
-    def _on_loaded(self, binary: core.Binary | None, err: Exception | None):
+    def _on_loaded(self, binary: core.Binary | None, err: Exception | None, seq: int):
+        if seq != self._load_seq:
+            return  # пока грузился этот файл, уже открыли следующий
         if err is not None:
             self._error(str(err) if isinstance(err, core.LoadError) else f"Ошибка: {err!r}")
             return
@@ -514,24 +551,12 @@ class App(ctk.CTk):
         text = self.goto_entry.get().strip()
         if not text or self.binary is None:
             return
-        addr = self._resolve(text)
+        addr = self.binary.resolve(text)
         if addr is None:
             self._error(f"Не нашёл адрес или символ «{text}»")
             return
         self.goto(addr)
         self.text.focus_set()
-
-    def _resolve(self, text: str) -> int | None:
-        try:
-            return core.parse_address(text)
-        except ValueError:
-            pass
-        low = text.lower()
-        exact = [a for a, n in self._sym_items if n.lower() == low]
-        if exact:
-            return exact[0]
-        partial = [a for a, n in self._sym_items if low in n.lower()]
-        return partial[0] if partial else None
 
     def follow_current(self):
         row = self._row_index(self.cur_addr) if self.cur_addr is not None else None
@@ -716,19 +741,16 @@ class App(ctk.CTk):
     def _on_text_click(self, event):
         self.text.focus_set()
         line = self._line_at(event)
-        if 1 <= line <= len(self.rows):
-            self.cur_addr = self.rows[line - 1].insn.address
-            self._highlight_current()
-            self._update_status_right()
-
-    def _on_link_click(self, event):
-        line = self._line_at(event)
-        if 1 <= line <= len(self.rows):
-            target = self.rows[line - 1].insn.target
-            if target is not None:
-                self.cur_addr = self.rows[line - 1].insn.address
-                self.goto(target)
-        return "break"
+        if not 1 <= line <= len(self.rows):
+            return None
+        insn = self.rows[line - 1].insn
+        self.cur_addr = insn.address
+        if insn.target is not None and "link" in self.text.tag_names(f"@{event.x},{event.y}"):
+            self.goto(insn.target)
+            return "break"
+        self._highlight_current()
+        self._update_status_right()
+        return None
 
     def _on_motion(self, event):
         self._set_hover(self._line_at(event))
@@ -809,6 +831,8 @@ class App(ctk.CTk):
                 return [(i.address, f"{i.mnemonic} {i.op_str}") for i in b.search_text(query)]
 
         def done(hits, err):
+            if self.binary is not b:
+                return  # пока искали, открыли другой файл — адреса уже не про него
             if err is not None:
                 self._error(f"Поиск упал: {err!r}")
                 return
