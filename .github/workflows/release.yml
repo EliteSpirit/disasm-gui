@@ -19,8 +19,25 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # версию берём из env, а не подставляем ${{ }} прямо в скрипт: так её текст не может
+      # стать частью команды
+      VERSION: ${{ inputs.version || github.ref_name }}
     steps:
+      # проверяем до сборки: с «v1.0-rc1» version_file.py упал бы только после тестов
+      - name: Check version
+        shell: bash
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+(\.[0-9]+){0,3}$ ]]; then
+            echo "::error::Версия должна быть вида v1.2.3, а пришло: $VERSION"
+            exit 1
+          fi
+
+      # токен с правом записи не оставляем в .git/config: дальше ставятся и запускаются
+      # сторонние пакеты, а релиз публикует action ниже со своим токеном
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -40,7 +57,7 @@ jobs:
 
       - name: Build exe
         run: |
-          python tools/version_file.py ${{ inputs.version || github.ref_name }} > version.txt
+          python tools/version_file.py $env:VERSION > version.txt
           python -m PyInstaller --noconfirm --onefile --windowed --name DisasmGUI --version-file version.txt --collect-all customtkinter --collect-all capstone gui.py
 
       # Подпись через SignPath Foundation. Шаги ниже пропускаются, пока в
@@ -73,9 +90,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version || github.ref_name }}
+          tag_name: ${{ env.VERSION }}
           target_commitish: ${{ github.sha }}
-          name: Disasm GUI ${{ inputs.version || github.ref_name }}
+          name: Disasm GUI ${{ env.VERSION }}
           body_path: RELEASE_NOTES.md
           files: |
             dist/DisasmGUI.exe

@@ -1,6 +1,7 @@
 # Зависимости для запуска из исходников: pip install -r requirements.txt
 customtkinter>=5.2.0
-capstone>=5.0.1
+# в Capstone 6 переименованы архитектуры (ARM64 -> AARCH64) и группы инструкций
+capstone>=5.0.1,<6
 pefile>=2023.2.7
 pyelftools>=0.30
 
